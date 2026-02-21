@@ -16,6 +16,7 @@ def validate_config():
 BASEROW_TOKEN = os.getenv('BASEROW_TOKEN')
 SLEEP_SECONDS = int(os.getenv('SLEEP_SECONDS', 3600))
 PRIMARY_TABLE_ID = os.getenv('PRIMARY_TABLE_ID')
+SECONDARY_COLUMN_PREFIX = os.getenv('SECONDARY_COLUMN_PREFIX')
 MULTI_SELECT_COLUMN_ID = os.getenv('MULTI_SELECT_COLUMN_ID')
 PRIMARY_ID_COLUMN_NAME = os.getenv('PRIMARY_ID_TRACKER') 
 BASEROW_URL = os.getenv("BASEROW_URL", "https://api.baserow.io")
@@ -58,6 +59,10 @@ def get_field_and_option_map(target_table_id, primary_field_defs):
     tracker_key = f"field_{tracker_field['id']}" if tracker_field else None
     return field_mapping, option_mapping, tracker_key
 
+def get_secondary_table_name(primary_meta, label):
+    secondary_prefix = SECONDARY_COLUMN_PREFIX or f"{primary_meta['name']}_"
+    return f"{secondary_prefix}{label}"
+
 def sync_database():
     logger.info("--- Starting Sync Cycle ---")
     all_tables = make_request('GET', f"{BASEROW_URL}/api/database/tables/all-tables/")
@@ -95,7 +100,7 @@ def sync_database():
     logger.info(f"Found {len(categorized)} unique categories in multi-select column.")
 
     for label, target_rows in categorized.items():
-        target_name = f"{primary_meta['name']}_{label}"
+        target_name = get_secondary_table_name(primary_meta, label)
         if target_name not in table_map:
             logger.debug(f"Skipping category '{label}': No target table named '{target_name}' exists.")
             continue

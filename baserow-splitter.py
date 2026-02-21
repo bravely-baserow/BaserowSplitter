@@ -1,120 +1,159 @@
+import logging
 import os
 import requests
 import time
+import sys
 
-# --- CONFIGURATION ---
+# --- VALIDATION ---
+def validate_config():
+    required = ['BASEROW_TOKEN', 'PRIMARY_TABLE_ID', 'MULTI_SELECT_COLUMN_ID', 'PRIMARY_ID_TRACKER', 'CLONE_COLUMNS']
+    missing = [v for v in required if not os.getenv(v)]
+    if missing:
+        print(f"❌ FATAL ERROR: Missing variables: {', '.join(missing)}")
+        sys.exit(1)
+
+# Env Vars
 BASEROW_TOKEN = os.getenv('BASEROW_TOKEN')
 SLEEP_SECONDS = int(os.getenv('SLEEP_SECONDS', 3600))
-DATABASE_ID = os.getenv('DATABASE_ID')
 PRIMARY_TABLE_ID = os.getenv('PRIMARY_TABLE_ID')
-MULTI_SELECT_COLUMN_NAME = os.getenv('MULTI_SELECT_COLUMN_NAME', 'MultiSelect')
-PRIMARY_ID_TRACKER = os.getenv('PRIMARY_ID_TRACKER', 'Primary_Row_ID')
-BASEROW_URL = 'https://api.baserow.io'
+MULTI_SELECT_COLUMN_ID = os.getenv('MULTI_SELECT_COLUMN_ID')
+PRIMARY_ID_COLUMN_NAME = os.getenv('PRIMARY_ID_TRACKER') 
+BASEROW_URL = os.getenv("BASEROW_URL", "https://api.baserow.io")
+CLONE_COLUMNS_LIST = [c.strip() for c in os.getenv("CLONE_COLUMNS", "").split(",")] if os.getenv("CLONE_COLUMNS") else []
 
-HEADERS = {
-    'Authorization': f'Token {BASEROW_TOKEN}',
-    'Content-Type': 'application/json'
-}
+HEADERS = {'Authorization': f'Token {BASEROW_TOKEN}', 'Content-Type': 'application/json'}
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 def make_request(method, url, **kwargs):
+    logger.debug(f"API Request: {method} {url}")
     kwargs['headers'] = HEADERS
     response = requests.request(method, url, **kwargs)
     if not response.ok:
-        print(f"API Error: {response.status_code} - {response.text}")
+        logger.error(f"API Error: {response.status_code} - {response.text}")
         response.raise_for_status()
     return response.json() if response.content else None
 
-def get_all_rows(table_id):
-    rows = []
-    url = f"{BASEROW_URL}/api/database/rows/table/{table_id}/?user_field_names=true"
-    while url:
-        data = make_request('GET', url)
-        rows.extend(data['results'])
-        url = data.get('next')
-    return rows
+def get_field_and_option_map(target_table_id, primary_field_defs):
+    target_fields = make_request('GET', f"{BASEROW_URL}/api/database/fields/table/{target_table_id}/")
+    target_name_map = {f['name']: f for f in target_fields}
+    
+    field_mapping = {}
+    option_mapping = {}
+    
+    for pf in primary_field_defs:
+        p_id_key = f"field_{pf['id']}"
+        p_name = pf['name']
+        
+        if p_name in target_name_map:
+            tf = target_name_map[p_name]
+            t_id_key = f"field_{tf['id']}"
+            field_mapping[p_id_key] = t_id_key
+            if 'select_options' in tf:
+                option_mapping[t_id_key] = {opt['value']: opt['id'] for opt in tf['select_options']}
+        else:
+            logger.warning(f"Field '{p_name}' not found in target table {target_table_id}")
 
-def get_tables():
-    """Fetches all tables in the database."""
-    url = f"{BASEROW_URL}/api/database/tables/all-tables/"
-    return make_request('GET', url)
-
-def get_fields(table_id):
-    """Fetches the schema/fields of a table."""
-    url = f"{BASEROW_URL}/api/database/fields/table/{table_id}/"
-    return make_request('GET', url)
+    tracker_field = target_name_map.get(PRIMARY_ID_COLUMN_NAME)
+    tracker_key = f"field_{tracker_field['id']}" if tracker_field else None
+    return field_mapping, option_mapping, tracker_key
 
 def sync_database():
-    print("Fetching database schema...")
-    all_tables = get_tables()
-
-    primary_table_meta = next((t for t in all_tables if str(t['id']) == str(PRIMARY_TABLE_ID)), None)
+    logger.info("--- Starting Sync Cycle ---")
+    all_tables = make_request('GET', f"{BASEROW_URL}/api/database/tables/all-tables/")
     
-    if not primary_table_meta:
-        print(f"Error: Could not find a table with ID {PRIMARY_TABLE_ID}")
+    # Identify Primary Meta
+    primary_meta = next((t for t in all_tables if str(t['id']) == str(PRIMARY_TABLE_ID)), None)
+    if not primary_meta:
+        logger.error(f"Primary table {PRIMARY_TABLE_ID} not found.")
         return
-    
-    primary_table_name = primary_table_meta.get('name')
 
-    print("Fetching primary table schema and rows...")
-    primary_fields = get_fields(PRIMARY_TABLE_ID)
-    primary_rows = get_all_rows(PRIMARY_TABLE_ID)
+    primary_fields = make_request('GET', f"{BASEROW_URL}/api/database/fields/table/{PRIMARY_TABLE_ID}/")
+    fields_to_clone = [f for f in primary_fields if str(f['id']) in CLONE_COLUMNS_LIST]
     
-    existing_tables = {t['name']: t['id'] for t in get_tables()}
+    logger.info(f"Targeting {len(fields_to_clone)} columns for cloning: {[f['name'] for f in fields_to_clone]}")
 
-    # Map out which rows belong to which multi-select
-    selected_options = {}
+    # Fetch Primary Rows
+    primary_rows = []
+    url = f"{BASEROW_URL}/api/database/rows/table/{PRIMARY_TABLE_ID}/?user_field_names=false"
+    while url:
+        data = make_request('GET', url)
+        primary_rows.extend(data['results'])
+        url = data.get('next')
     
+    logger.info(f"Fetched {len(primary_rows)} total rows from Primary Table '{primary_meta['name']}'")
+
+    table_map = {t['name']: t['id'] for t in all_tables}
+    control_key = f"field_{MULTI_SELECT_COLUMN_ID}"
+
+    # Grouping
+    categorized = {}
     for row in primary_rows:
-        multi_select_for_row = row.get(MULTI_SELECT_COLUMN_NAME, [])
-        for selection_option in multi_select_for_row:
-            selection = selection_option.get('value')
-            if selection not in selected_options:
-                selected_options[selection] = []
-            selected_options[selection].append(row)
+        for opt in row.get(control_key, []):
+            categorized.setdefault(opt['value'], []).append(row)
 
-    # Process each required "select" table
-    for select, target_rows in selected_options.items():
-        table_name = f"{primary_table_name}_{select}"
-        
-        if table_name not in existing_tables:
-            print(f"Skipping {select}: Table '{table_name}' not found. Please create it manually.")
+    logger.info(f"Found {len(categorized)} unique categories in multi-select column.")
+
+    for label, target_rows in categorized.items():
+        target_name = f"{primary_meta['name']}_{label}"
+        if target_name not in table_map:
+            logger.debug(f"Skipping category '{label}': No target table named '{target_name}' exists.")
             continue
+        
+        t_id = table_map[target_name]
+        f_map, opt_map, tracker_key = get_field_and_option_map(t_id, fields_to_clone)
+        
+        if not tracker_key:
+            logger.error(f"Tracker column '{PRIMARY_ID_COLUMN_NAME}' missing in '{target_name}'. Cannot sync.")
+            continue
+
+        # Get target rows
+        sec_rows = []
+        sec_url = f"{BASEROW_URL}/api/database/rows/table/{t_id}/?user_field_names=false"
+        while sec_url:
+            data = make_request('GET', sec_url)
+            sec_rows.extend(data['results'])
+            sec_url = data.get('next')
             
-        table_id = existing_tables[table_name]
-        print(f"Syncing {len(target_rows)} rows to {table_name}...")
+        sec_by_origin = {str(r.get(tracker_key)): r for r in sec_rows if r.get(tracker_key)}
+        logger.info(f"Syncing {len(target_rows)} rows to '{target_name}' (Target ID: {t_id})")
 
-        # Get secondary rows to compare
-        sec_rows = get_all_rows(table_id)
-        sec_rows_by_primary_id = {
-            int(r[PRIMARY_ID_TRACKER]): r 
-            for r in sec_rows if r.get(PRIMARY_ID_TRACKER) is not None
-        }
-
-        # Update or Create
-        expected_ids = []
+        synced_ids = []
         for p_row in target_rows:
-            p_id = p_row['id']
-            expected_ids.append(p_id)
-            payload = p_row.copy()
-            payload[PRIMARY_ID_TRACKER] = p_id
-            for key in ['id', 'order']: payload.pop(key, None)
+            p_id = str(p_row['id'])
+            synced_ids.append(p_id)
+            payload = {tracker_key: p_id}
 
-            if p_id in sec_rows_by_primary_id:
-                s_id = sec_rows_by_primary_id[p_id]['id']
-                make_request('PATCH', f"{BASEROW_URL}/api/database/rows/table/{table_id}/{s_id}/?user_field_names=true", json=payload)
+            for p_key, t_key in f_map.items():
+                val = p_row.get(p_key)
+                if val is None: continue
+
+                if t_key in opt_map:
+                    if isinstance(val, list):
+                        payload[t_key] = [opt_map[t_key][item['value']] for item in val if item['value'] in opt_map[t_key]]
+                    elif isinstance(val, dict):
+                        payload[t_key] = opt_map[t_key].get(val['value'])
+                else:
+                    payload[t_key] = val
+
+            if p_id in sec_by_origin:
+                make_request('PATCH', f"{BASEROW_URL}/api/database/rows/table/{t_id}/{sec_by_origin[p_id]['id']}/?user_field_names=false", json=payload)
             else:
-                make_request('POST', f"{BASEROW_URL}/api/database/rows/table/{table_id}/?user_field_names=true", json=payload)
+                make_request('POST', f"{BASEROW_URL}/api/database/rows/table/{t_id}/?user_field_names=false", json=payload)
 
         # Cleanup
-        for s_p_id, s_row in sec_rows_by_primary_id.items():
-            if s_p_id not in expected_ids:
-                make_request('DELETE', f"{BASEROW_URL}/api/database/rows/table/{table_id}/{s_row['id']}/")
+        orphans = [oid for oid in sec_by_origin if oid not in synced_ids]
+        if orphans:
+            logger.info(f"Removing {len(orphans)} orphaned rows from '{target_name}'")
+            for oid in orphans:
+                make_request('DELETE', f"{BASEROW_URL}/api/database/rows/table/{t_id}/{sec_by_origin[oid]['id']}/")
 
 if __name__ == "__main__":
+    validate_config()
     while True:
         try:
             sync_database()
-            print(f"Sync complete. Sleeping {SLEEP_SECONDS}s...")
-        except Exception as e:
-            print(f"Runtime error: {e}")
+            logger.info(f"Cycle finished. Waiting {SLEEP_SECONDS} seconds...")
+        except Exception:
+            logger.exception("A critical error occurred during the sync cycle.")
         time.sleep(SLEEP_SECONDS)

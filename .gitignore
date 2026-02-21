@@ -1,0 +1,15 @@
+# --- Secrets and Local Config ---
+.env
+.vscode/
+
+# --- Python specific ---
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+
+# --- Operating System specific ---
+.DS_Store
+Thumbs.db

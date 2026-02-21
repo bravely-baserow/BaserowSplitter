@@ -67,7 +67,6 @@ def sync_database():
     logger.info("--- Starting Sync Cycle ---")
     all_tables = make_request('GET', f"{BASEROW_URL}/api/database/tables/all-tables/")
     
-    # Identify Primary Meta
     primary_meta = next((t for t in all_tables if str(t['id']) == str(PRIMARY_TABLE_ID)), None)
     if not primary_meta:
         logger.error(f"Primary table {PRIMARY_TABLE_ID} not found.")
@@ -78,7 +77,6 @@ def sync_database():
     
     logger.info(f"Targeting {len(fields_to_clone)} columns for cloning: {[f['name'] for f in fields_to_clone]}")
 
-    # Fetch Primary Rows
     primary_rows = []
     url = f"{BASEROW_URL}/api/database/rows/table/{PRIMARY_TABLE_ID}/?user_field_names=false"
     while url:
@@ -94,25 +92,36 @@ def sync_database():
     # Grouping
     categorized = {}
     for row in primary_rows:
-        for opt in row.get(control_key, []):
-            categorized.setdefault(opt['value'], []).append(row)
+        options = row.get(control_key, [])
+        if not options: continue
+        
+        # If the field is a Lookup/Formula, 'options' might be a list of strings
+        # If it's a true Multi-select, 'options' is a list of dicts
+        for opt in options:
+            if isinstance(opt, dict):
+                label = opt.get('value')
+            else:
+                label = str(opt) # Fallback for strings
+                
+            if label:
+                categorized.setdefault(label, []).append(row)
 
-    logger.info(f"Found {len(categorized)} unique categories in multi-select column.")
+    logger.info(f"Identified {len(categorized)} categories: {', '.join(categorized.keys())}")
 
     for label, target_rows in categorized.items():
         target_name = get_secondary_table_name(primary_meta, label)
         if target_name not in table_map:
-            logger.debug(f"Skipping category '{label}': No target table named '{target_name}' exists.")
+            logger.debug(f"Skipping '{label}': Table '{target_name}' does not exist.")
             continue
         
         t_id = table_map[target_name]
         f_map, opt_map, tracker_key = get_field_and_option_map(t_id, fields_to_clone)
         
         if not tracker_key:
-            logger.error(f"Tracker column '{PRIMARY_ID_COLUMN_NAME}' missing in '{target_name}'. Cannot sync.")
+            logger.error(f"Tracker column '{PRIMARY_ID_COLUMN_NAME}' missing in '{target_name}'. Skipping table.")
             continue
 
-        # Get target rows
+        # Fetch Target Rows for comparison
         sec_rows = []
         sec_url = f"{BASEROW_URL}/api/database/rows/table/{t_id}/?user_field_names=false"
         while sec_url:
@@ -121,7 +130,7 @@ def sync_database():
             sec_url = data.get('next')
             
         sec_by_origin = {str(r.get(tracker_key)): r for r in sec_rows if r.get(tracker_key)}
-        logger.info(f"Syncing {len(target_rows)} rows to '{target_name}' (Target ID: {t_id})")
+        logger.info(f"Syncing {len(target_rows)} rows to '{target_name}'...")
 
         synced_ids = []
         for p_row in target_rows:
@@ -135,7 +144,9 @@ def sync_database():
 
                 if t_key in opt_map:
                     if isinstance(val, list):
-                        payload[t_key] = [opt_map[t_key][item['value']] for item in val if item['value'] in opt_map[t_key]]
+                        # Use .get('value') if it's a dict, otherwise use the string itself
+                        payload[t_key] = [opt_map[t_key][i['value'] if isinstance(i, dict) else i] 
+                                         for i in val if (i['value'] if isinstance(i, dict) else i) in opt_map[t_key]]
                     elif isinstance(val, dict):
                         payload[t_key] = opt_map[t_key].get(val['value'])
                 else:
@@ -146,10 +157,10 @@ def sync_database():
             else:
                 make_request('POST', f"{BASEROW_URL}/api/database/rows/table/{t_id}/?user_field_names=false", json=payload)
 
-        # Cleanup
+        # Cleanup orphans
         orphans = [oid for oid in sec_by_origin if oid not in synced_ids]
         if orphans:
-            logger.info(f"Removing {len(orphans)} orphaned rows from '{target_name}'")
+            logger.info(f"Cleaning up {len(orphans)} orphaned rows from '{target_name}'.")
             for oid in orphans:
                 make_request('DELETE', f"{BASEROW_URL}/api/database/rows/table/{t_id}/{sec_by_origin[oid]['id']}/")
 
@@ -158,7 +169,7 @@ if __name__ == "__main__":
     while True:
         try:
             sync_database()
-            logger.info(f"Cycle finished. Waiting {SLEEP_SECONDS} seconds...")
+            logger.info(f"--- Cycle Complete. Waiting {SLEEP_SECONDS}s ---")
         except Exception:
             logger.exception("A critical error occurred during the sync cycle.")
         time.sleep(SLEEP_SECONDS)

@@ -24,4 +24,4 @@ jobs:
         run: docker build -t bravely-baserow/baserow-splitter:latest .
 
       - name: Push Docker Image to Docker Hub
-        run: docker push myusername/myapp:latest
+        run: docker push bravely-baserow/baserow-splitter:latest

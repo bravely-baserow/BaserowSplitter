@@ -92,16 +92,18 @@ def sync_database():
     # Grouping
     categorized = {}
     for row in primary_rows:
-        options = row.get(control_key, [])
-        if not options: continue
+        raw_val = row.get(control_key)
+        if not raw_val: continue
         
-        # If the field is a Lookup/Formula, 'options' might be a list of strings
-        # If it's a true Multi-select, 'options' is a list of dicts
-        for opt in options:
-            if isinstance(opt, dict):
-                label = opt.get('value')
+        # Ensure we are working with a list of values
+        items = raw_val if isinstance(raw_val, list) else [raw_val]
+        
+        for item in items:
+            # Extract the actual text label
+            if isinstance(item, dict):
+                label = item.get('value')
             else:
-                label = str(opt) # Fallback for strings
+                label = str(item)
                 
             if label:
                 categorized.setdefault(label, []).append(row)

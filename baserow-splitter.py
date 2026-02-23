@@ -3,6 +3,7 @@ import os
 import requests
 import time
 import sys
+import json
 
 # --- VALIDATION ---
 def validate_config():
@@ -26,6 +27,18 @@ HEADERS = {'Authorization': f'Token {BASEROW_TOKEN}', 'Content-Type': 'applicati
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+
+# Filter Logic: Expected format '{"123": ["Value1", "Value2"], "456": ["Allow"]}'
+ROW_FILTERS_RAW = os.getenv('ROW_FILTERS', '{}')
+try:
+    ROW_FILTERS = json.loads(ROW_FILTERS_RAW)
+    # Baserow needs keys formatted as `field_123`, but we don't want to leak that info to the config.
+    # Therefore, we need to add the `field_` prefix to each key in the filter config.
+    ROW_FILTERS = {f"field_{k}": v for k, v in ROW_FILTERS.items()}
+except json.JSONDecodeError:
+    logger.error(f"❌ FATAL ERROR: ROW_FILTERS is not valid JSON: {ROW_FILTERS_RAW}")
+    sys.exit(1)
+
 def make_request(method, url, **kwargs):
     logger.debug(f"API Request: {method} {url}")
     kwargs['headers'] = HEADERS
@@ -34,6 +47,26 @@ def make_request(method, url, **kwargs):
         logger.error(f"API Error: {response.status_code} - {response.text}")
         response.raise_for_status()
     return response.json() if response.content else None
+
+def row_passes_filters(row):
+    """Checks if the row contains allowed values for the specified filter columns."""
+    for field_key, allowed_values in ROW_FILTERS.items():
+        cell_value = row.get(field_key)
+        
+        # Extract string value from cell (handles strings, select dicts, and multi-select lists)
+        current_values = []
+        if isinstance(cell_value, list):
+            current_values = [i.get('value') if isinstance(i, dict) else str(i) for i in cell_value]
+        elif isinstance(cell_value, dict):
+            current_values = [cell_value.get('value')]
+        else:
+            current_values = [str(cell_value)] if cell_value is not None else []
+
+        # Check if there's any overlap between current cell values and allowed values
+        if not any(val in allowed_values for val in current_values):
+            logger.debug(f"Row {row.get('id')} blocked by filter on {field_key}. Values {current_values} not in {allowed_values}")
+            return False
+    return True
 
 def get_field_and_option_map(target_table_id, primary_field_defs):
     target_fields = make_request('GET', f"{BASEROW_URL}/api/database/fields/table/{target_table_id}/")
@@ -86,12 +119,16 @@ def sync_database():
     
     logger.info(f"Fetched {len(primary_rows)} total rows from Primary Table '{primary_meta['name']}'")
 
+    # Apply Allowlist Filtering
+    filtered_rows = [r for r in primary_rows if row_passes_filters(r)]
+    logger.info(f"Rows passing filters: {len(filtered_rows)} of {len(primary_rows)}")
+
     table_map = {t['name']: t['id'] for t in all_tables}
     control_key = f"field_{MULTI_SELECT_COLUMN_ID}"
 
     # Grouping
     categorized = {}
-    for row in primary_rows:
+    for row in filtered_rows:
         raw_val = row.get(control_key)
         if not raw_val: continue
         

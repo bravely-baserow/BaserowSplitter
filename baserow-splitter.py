@@ -62,6 +62,7 @@ def row_passes_filters(row):
         else:
             current_values = [str(cell_value)] if cell_value is not None else []
 
+        logger.debug(f"Filtering Row {row.get('id')}: Field {field_key} has values {current_values}, allowed are {allowed_values}")
         # Check if there's any overlap between current cell values and allowed values
         if not any(val in allowed_values for val in current_values):
             logger.debug(f"Row {row.get('id')} blocked by filter on {field_key}. Values {current_values} not in {allowed_values}")

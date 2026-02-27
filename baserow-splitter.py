@@ -62,11 +62,12 @@ def row_passes_filters(row):
         else:
             current_values = [str(cell_value)] if cell_value is not None else []
 
-        logger.debug(f"Filtering Row {row.get('id')}: Field {field_key} has values {current_values}, allowed are {allowed_values}")
         # Check if there's any overlap between current cell values and allowed values
         if not any(val in allowed_values for val in current_values):
             logger.debug(f"Row {row.get('id')} blocked by filter on {field_key}. Values {current_values} not in {allowed_values}")
             return False
+    
+    logger.debug(f"Row {row.get('id')} passed all filters.")
     return True
 
 def get_field_and_option_map(target_table_id, primary_field_defs):
@@ -111,12 +112,7 @@ def sync_database():
     
     logger.info(f"Targeting {len(fields_to_clone)} columns for cloning: {[f['name'] for f in fields_to_clone]}")
 
-    primary_rows = []
-    url = f"{BASEROW_URL}/api/database/rows/table/{PRIMARY_TABLE_ID}/?user_field_names=false"
-    while url:
-        data = make_request('GET', url)
-        primary_rows.extend(data['results'])
-        url = data.get('next')
+    primary_rows = get_rows_from_table(PRIMARY_TABLE_ID)
     
     logger.info(f"Fetched {len(primary_rows)} total rows from Primary Table '{primary_meta['name']}'")
 
@@ -131,7 +127,9 @@ def sync_database():
     categorized = {}
     for row in filtered_rows:
         raw_val = row.get(control_key)
-        if not raw_val: continue
+        if not raw_val:
+            logger.debug(f"Row {row.get('id')} skipped: No value in control column")
+            continue
         
         # Ensure we are working with a list of values
         items = raw_val if isinstance(raw_val, list) else [raw_val]
@@ -144,14 +142,17 @@ def sync_database():
                 label = str(item)
                 
             if label:
+                logger.debug(f"Row {row.get('id')} categorized under '{label}'")
                 categorized.setdefault(label, []).append(row)
+            else:
+                logger.debug(f"Row {row.get('id')} skipped: Unable to extract label from control column value '{item}'")
 
     logger.info(f"Identified {len(categorized)} categories: {', '.join(categorized.keys())}")
 
     for label, target_rows in categorized.items():
         target_name = get_secondary_table_name(primary_meta, label)
         if target_name not in table_map:
-            logger.debug(f"Skipping '{label}': Table '{target_name}' does not exist.")
+            logger.error(f"Skipping '{label}': Table '{target_name}' does not exist.")
             continue
         
         t_id = table_map[target_name]
@@ -162,19 +163,14 @@ def sync_database():
             continue
 
         # Fetch Target Rows for comparison
-        sec_rows = []
-        sec_url = f"{BASEROW_URL}/api/database/rows/table/{t_id}/?user_field_names=false"
-        while sec_url:
-            data = make_request('GET', sec_url)
-            sec_rows.extend(data['results'])
-            sec_url = data.get('next')
-            
+        sec_rows = get_rows_from_table(t_id)
         sec_by_origin = {str(r.get(tracker_key)): r for r in sec_rows if r.get(tracker_key)}
         logger.info(f"Syncing {len(target_rows)} rows to '{target_name}'...")
 
         synced_ids = []
         for p_row in target_rows:
             p_id = str(p_row['id'])
+            logger.debug(f"Processing Primary Row ID {p_id} for '{target_name}'")
             synced_ids.append(p_id)
             payload = {tracker_key: p_id}
 
@@ -203,6 +199,15 @@ def sync_database():
             logger.info(f"Cleaning up {len(orphans)} orphaned rows from '{target_name}'.")
             for oid in orphans:
                 make_request('DELETE', f"{BASEROW_URL}/api/database/rows/table/{t_id}/{sec_by_origin[oid]['id']}/")
+
+def get_rows_from_table(table_id):
+    primary_rows = []
+    url = f"{BASEROW_URL}/api/database/rows/table/{table_id}/?user_field_names=false"
+    while url:
+        data = make_request('GET', url)
+        primary_rows.extend(data['results'])
+        url = data.get('next')
+    return primary_rows
 
 if __name__ == "__main__":
     validate_config()
